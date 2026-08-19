@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Brooklyn Bridge Runner</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#0a0e1a;font-family:'Courier New',monospace;height:100%;}
+  #wrap{position:relative;width:100%;height:100vh;display:flex;align-items:center;justify-content:center;background:#000;}
+  canvas{display:block;image-rendering:optimizeSpeed;max-width:100%;max-height:100%;}
+
+  #hud{position:absolute;top:0;left:0;right:0;padding:10px 14px;box-sizing:border-box;
+       display:flex;justify-content:space-between;align-items:flex-start;pointer-events:none;
+       text-shadow:2px 2px 0 #000;color:#fff;}
+  #hud .label{font-size:13px;letter-spacing:1px;text-transform:uppercase;color:#ffd35c;}
+  #progressOuter{width:150px;height:10px;border:2px solid #fff;background:#00000066;margin-top:4px;}
+  #progressInner{height:100%;width:0%;background:linear-gradient(90deg,#ffd35c,#ff8c3c);}
+
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+           background:radial-gradient(ellipse at center,#1b2740 0%,#05070d 100%);color:#fff;text-align:center;
+           padding:20px;box-sizing:border-box;}
+  #overlay h1{font-size:clamp(20px,5vw,36px);color:#ffd35c;text-shadow:3px 3px 0 #7a3e00;letter-spacing:2px;margin:0 0 6px;}
+  #overlay p{font-size:clamp(12px,2.5vw,16px);max-width:480px;line-height:1.6;margin:6px 0;}
+  #overlay button{margin-top:18px;padding:12px 28px;font-family:inherit;font-size:16px;font-weight:bold;
+                  color:#3a2000;background:linear-gradient(180deg,#ffe08a,#ff9f3c);border:3px solid #7a3e00;
+                  border-radius:6px;cursor:pointer;letter-spacing:1px;box-shadow:0 4px 0 #7a3e00;}
+  #overlay button:active{transform:translateY(3px);box-shadow:0 1px 0 #7a3e00;}
+  #hidden{display:none !important;}
+
+  #touch{position:absolute;bottom:0;left:0;right:0;display:flex;justify-content:space-between;
+        padding:0 18px 18px;box-sizing:border-box;pointer-events:none;}
+  .tbtn{pointer-events:auto;width:74px;height:74px;border-radius:50%;background:#ffffff22;
+       border:3px solid #ffffff55;color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;
+       user-select:none;-webkit-user-select:none;touch-action:manipulation;}
+  .tbtn:active{background:#ffffff44;}
+  @media (min-width:900px){ #touch{display:none;} }
+
+  #msgBanner{position:absolute;top:46%;left:0;right:0;text-align:center;color:#fff;font-size:clamp(16px,3.5vw,26px);
+      text-shadow:3px 3px 0 #000;letter-spacing:1px;opacity:0;transition:opacity .5s;pointer-events:none;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+
+  <div id="hud" class="hidden">
+    <div>
+      <div class="label" id="zoneLabel">Brooklyn Entrance</div>
+      <div id="progressOuter"><div id="progressInner"></div></div>
+    </div>
+    <div style="text-align:right">
+      <div class="label">Speed</div>
+      <div id="speedReadout" style="font-size:16px">0</div>
+    </div>
+  </div>
+
+  <div id="msgBanner"></div>
+
+  <div id="touch">
+    <div class="tbtn" id="btnLeft">◀</div>
+    <div class="tbtn" id="btnRight">▶</div>
+  </div>
+
+  <div id="overlay">
+    <h1>BROOKLYN BRIDGE RUNNER</h1>
+    <p>Climb the stairs on the Brooklyn side and run the wooden promenade all the way to City&nbsp;Hall.
+       Steer with <b>← →</b> or <b>A / D</b> (or the on-screen buttons on mobile). Stay on the deck!</p>
+    <button id="startBtn">START RUN</button>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---------------------------------------------------------------------
+   CANVAS SETUP
+--------------------------------------------------------------------- */
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var W = 800, H = 500; // internal render resolution (4:2.5 arcade-ish)
+
+function resize(){
+  var wrap = document.getElementById('wrap');
+  var scale = Math.min(wrap.clientWidth / W, wrap.clientHeight / H);
+  canvas.style.width = (W*scale)+'px';
+  canvas.style.height = (H*scale)+'px';
+  canvas.width = W;
+  canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------------------------------------------------------------------
+   PSEUDO-3D ROAD CONSTANTS  (classic segment-based road renderer)
+--------------------------------------------------------------------- */
+var SEG_LEN        = 200;       // world length of one segment
+var ROAD_WIDTH      = 1500;      // half width in world units of the deck
+var RAIL_WIDTH       = 220;       // width of the railings beyond deck edge
+var CAMERA_HEIGHT    = 900;
+var FOV               = 100;
+var CAMERA_DEPTH      = 1 / Math.tan((FOV/2) * Math.PI/180);
+var DRAW_DISTANCE     = 180;      // segments rendered ahead
+var FOG_START         = 0.65;     // fraction of draw distance where fog begins
+
+/* ---- track layout (world z positions in segment indices) ------------ */
+var TOTAL_SEG   = 1400;
+var TOWER1_IDX  = 260;
+var TOWER2_IDX  = 900;
+var FINISH_IDX  = TOTAL_SEG - 40;
+var TRACK_Z     = TOTAL_SEG * SEG_LEN;
+
+var COL = {
+  sky1:'#bcd9ec', sky2:'#e9f3f7',
+  deckLight:'#9c7a52', deckDark:'#8a6a46',
+  rumbleLight:'#5b4530', rumbleDark:'#493823',
+  railLight:'#6b4a2f', railDark:'#5a3d27',
+  stone:'#9a9184', stoneDark:'#726b60', stoneShadow:'#4d473e',
+  cable:'#3a3a3a',
+  water:'#5f7f92'
+};
+
+/* ---------------------------------------------------------------------
+   SEGMENT BUILD
+--------------------------------------------------------------------- */
+function makeSegment(i){
+  return {
+    index:i,
+    p1:{world:{x:0,y:0,z:i*SEG_LEN}, camera:{}, screen:{}},
+    p2:{world:{x:0,y:0,z:(i+1)*SEG_LEN}, camera:{}, screen:{}},
+    color: (Math.floor(i/3)%2===0) ? {deck:COL.deckLight, rumble:COL.rumbleLight, rail:COL.railLight}
+                                     : {deck:COL.deckDark,  rumble:COL.rumbleDark,  rail:COL.railDark},
+    sprites:[]
+  };
+}
+
+var segments = [];
+for (var i=0;i<TOTAL_SEG;i++) segments.push(makeSegment(i));
+
+// entrance stone stairway (first few segments flagged)
+for (i=0;i<6;i++) segments[i].isStairs = true;
+
+// lamp posts, alternating sides every 6 segments
+for (i=20;i<TOTAL_SEG-30;i+=6){
+  segments[i].sprites.push({type:'lamp', offset: (i%12===0)? -1.22 : 1.22});
+}
+
+// suspension cable hangers between the two towers (and short approach spans)
+var CABLE_START = TOWER1_IDX - 70;
+var CABLE_END   = TOWER2_IDX + 70;
+for (i=CABLE_START;i<CABLE_END;i+=3){
+  if (i<0||i>=TOTAL_SEG) continue;
+  segments[i].sprites.push({type:'cable', offset:-1.0});
+  segments[i].sprites.push({type:'cable', offset: 1.0});
+}
+
+// the two great stone towers
+segments[TOWER1_IDX].sprites.push({type:'tower', offset:0});
+segments[TOWER1_IDX].isTower = true;
+segments[TOWER2_IDX].sprites.push({type:'tower', offset:0});
+segments[TOWER2_IDX].isTower = true;
+
+// City Hall finish gate + park trees
+for (i=FINISH_IDX;i<FINISH_IDX+3;i++){
+  segments[i].sprites.push({type:'cityhall', offset:0});
+  segments[i].isFinish = true;
+}
+for (i=FINISH_IDX-2;i<TOTAL_SEG-2;i+=4){
+  segments[i].sprites.push({type:'tree', offset: (i%8===0)? -1.5 : 1.5});
+}
+
+/* zone labels shown in HUD as player passes checkpoints */
+var ZONES = [
+  {z:0,               label:'Brooklyn Entrance'},
+  {z: (TOWER1_IDX-90)*SEG_LEN,  label:'Approaching Brooklyn Tower'},
+  {z: (TOWER1_IDX+20)*SEG_LEN,  label:'Crossing the Main Span'},
+  {z: (TOWER2_IDX-90)*SEG_LEN,  label:'Approaching Manhattan Tower'},
+  {z: (TOWER2_IDX+40)*SEG_LEN,  label:'Manhattan Side'},
+  {z: (FINISH_IDX-60)*SEG_LEN,  label:'City Hall Park Ahead'},
+  {z: FINISH_IDX*SEG_LEN,       label:'City Hall'}
+];
+
+/* ---------------------------------------------------------------------
+   GAME STATE
+--------------------------------------------------------------------- */
+var state = 'ready'; // ready | playing | finished
+var position = 0;         // world z of camera/player
+var playerX = 0;          // -1..1 lateral position on deck
+var steer = 0;             // -1,0,1 input
+var speed = 0;
+var MAX_SPEED = 5200;      // world units / sec
+var ACCEL = 4200;
+var currentZoneLabel = ZONES[0].label;
+var bobTimer = 0;
+var lastTime = null;
+
+/* ---------------------------------------------------------------------
+   INPUT
+--------------------------------------------------------------------- */
+var keys = {};
+window.addEventListener('keydown', function(e){
+  keys[e.key.toLowerCase()] = true;
+  if (state==='ready' && (e.key===' '||e.key==='Enter')) startGame();
+});
+window.addEventListener('keyup', function(e){ keys[e.key.toLowerCase()] = false; });
+
+function readSteer(){
+  var s = 0;
+  if (keys['arrowleft']||keys['a']) s -= 1;
+  if (keys['arrowright']||keys['d']) s += 1;
+  return s;
+}
+
+var btnLeft = document.getElementById('btnLeft');
+var btnRight = document.getElementById('btnRight');
+var touchSteer = 0;
+function bindTouch(el, val){
+  el.addEventListener('touchstart', function(e){ touchSteer = val; e.preventDefault(); }, {passive:false});
+  el.addEventListener('touchend', function(e){ touchSteer = 0; e.preventDefault(); }, {passive:false});
+  el.addEventListener('mousedown', function(){ touchSteer = val; });
+  window.addEventListener('mouseup', function(){ touchSteer = 0; });
+}
+bindTouch(btnLeft, -1);
+bindTouch(btnRight, 1);
+
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('overlay').addEventListener('click', function(e){ startGame(); });
+document.getElementById('overlay').addEventListener('touchend', function(e){ startGame(); e.preventDefault(); }, {passive:false});
+canvas.addEventListener('click', function(){ if(state==='ready') startGame(); });
+
+function startGame(){
+  if (state==='playing') return;
+  state = 'playing';
+  position = 0; playerX = 0; speed = 0;
+  document.getElementById('overlay').classList.add('hidden');
+  document.getElementById('hud').classList.remove('hidden');
+}
+
+function endGame(){
+  state = 'finished';
+  var ov = document.getElementById('overlay');
+  ov.innerHTML = '<h1>YOU MADE IT!</h1>' +
+    '<p>You crossed the Brooklyn Bridge and arrived at City Hall Park. ' +
+    'Next up: obstacles and hazards along the deck.</p>' +
+    '<button id="restartBtn">RUN AGAIN</button>';
+  ov.classList.remove('hidden');
+  document.getElementById('restartBtn').addEventListener('click', function(){
+    document.getElementById('overlay').classList.add('hidden');
+    startGame();
+  });
+}
+
+/* ---------------------------------------------------------------------
+   PROJECTION HELPERS
+--------------------------------------------------------------------- */
+function project(p, camX, camY, camZ){
+  p.camera.x = (p.world.x||0) - camX;
+  p.camera.y = (p.world.y||0) - camY;
+  p.camera.z = (p.world.z||0) - camZ;
+  var clampedZ = Math.max(p.camera.z, 1);
+  p.screen.scale = CAMERA_DEPTH / clampedZ;
+  p.screen.x = Math.round((W/2) + (p.screen.scale * p.camera.x * W/2));
+  p.screen.y = Math.round((H/2) - (p.screen.scale * p.camera.y * H/2));
+  p.screen.w = Math.round(p.screen.scale * ROAD_WIDTH * W/2);
+}
+
+function projectPoint(x,y,z,camX,camY,camZ){
+  var p = {world:{x:x,y:y,z:z}, camera:{}, screen:{}};
+  project(p, camX, camY, camZ);
+  return p;
+}
+
+function findSegment(z){
+  return segments[ Math.floor(z/SEG_LEN) % segments.length ];
+}
+
+/* cable "main cable" height at a given world z (sag between towers) */
+function cableHeight(z){
+  var t1 = TOWER1_IDX*SEG_LEN, t2 = TOWER2_IDX*SEG_LEN;
+  var MAXH = 950, MINH = 260;
+  if (z < t1){
+    var f = Math.max(0, (z-(t1-70*SEG_LEN))/(70*SEG_LEN));
+    return MINH + f*(MAXH-MINH);
+  }
+  if (z > t2){
+    var f2 = Math.max(0, ((t2+70*SEG_LEN)-z)/(70*SEG_LEN));
+    return MINH + f2*(MAXH-MINH);
+  }
+  var mid = (t1+t2)/2, half=(t2-t1)/2;
+  var d = Math.abs(z-mid)/half; // 0 at midspan .. 1 at tower
+  return MINH + (MAXH-MINH)*(d*d);
+}
+
+/* ---------------------------------------------------------------------
+   DRAW: BACKGROUND (sky + Manhattan skyline, subtle parallax)
+--------------------------------------------------------------------- */
+function drawBackground(camX){
+  // fully cover the canvas first so extreme steering never reveals a blank/transparent gap
+  ctx.fillStyle = COL.water;
+  ctx.fillRect(0,0,W,H);
+
+  var g = ctx.createLinearGradient(0,0,0,H*0.55);
+  g.addColorStop(0, COL.sky1);
+  g.addColorStop(1, COL.sky2);
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H*0.55);
+
+  // faint sun
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath(); ctx.arc(W*0.78, H*0.14, 34, 0, Math.PI*2); ctx.fill();
+
+  var parallax = -camX*0.02;
+  drawSkyline(parallax, 0.55, '#a9bccb', H*0.40);
+  drawSkyline(parallax*1.6, 0.85, '#7f95a8', H*0.44);
+
+  // water strip
+  ctx.fillStyle = COL.water;
+  ctx.fillRect(0, H*0.44, W, H*0.14);
+
+  // ground haze below the water line, in case the deck doesn't reach that far off-camera
+  ctx.fillStyle = '#c9c2b3';
+  ctx.fillRect(0, H*0.58, W, H*0.42);
+}
+
+function drawSkyline(offset, alpha, color, baseline){
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  var seed = 1337;
+  function rnd(){ seed = (seed*9301+49297)%233280; return seed/233280; }
+  var x = -200 + (offset % 220);
+  while (x < W+200){
+    var bw = 26 + rnd()*40;
+    var bh = 40 + rnd()*120;
+    ctx.fillRect(x, baseline-bh, bw, bh);
+    if (rnd()>0.7){ // antenna / spire
+      ctx.fillRect(x+bw/2-2, baseline-bh-18, 4, 18);
+    }
+    x += bw + 6 + rnd()*14;
+  }
+  ctx.restore();
+}
+
+/* ---------------------------------------------------------------------
+   DRAW: ROAD SEGMENT (trapezoid)
+--------------------------------------------------------------------- */
+function trapezoid(ctx, x1,y1,w1, x2,y2,w2, color){
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x1-w1, y1);
+  ctx.lineTo(x2-w2, y2);
+  ctx.lineTo(x2+w2, y2);
+  ctx.lineTo(x1+w1, y1);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function renderRoadSegment(seg){
+  var p1=seg.p1.screen, p2=seg.p2.screen;
+  var railW1 = p1.w*((ROAD_WIDTH+RAIL_WIDTH)/ROAD_WIDTH);
+  var railW2 = p2.w*((ROAD_WIDTH+RAIL_WIDTH)/ROAD_WIDTH);
+
+  // railing / rumble strip (wider band, drawn first)
+  trapezoid(ctx, p1.x,p1.y,railW1, p2.x,p2.y,railW2, seg.color.rail);
+  // deck
+  trapezoid(ctx, p1.x,p1.y,p1.w, p2.x,p2.y,p2.w, seg.color.deck);
+  // center plank seam
+  var cw1 = Math.max(1, p1.w*0.02), cw2 = Math.max(1, p2.w*0.02);
+  trapezoid(ctx, p1.x,p1.y,cw1, p2.x,p2.y,cw2, 'rgba(0,0,0,0.18)');
+}
+
+/* ---------------------------------------------------------------------
+   DRAW: SPRITES
+--------------------------------------------------------------------- */
+/* NOTE: "scale" passed to these draw functions is pixels-per-world-unit
+   (i.e. projection scale * W/2), matching how road width p.screen.w is
+   computed, so sprite sizes line up correctly with the road/deck. */
+
+function drawLamp(x,y,scale){
+  var h = 480*scale, w= 34*scale;
+  ctx.fillStyle = '#2b2b2b';
+  ctx.fillRect(x-w/2, y-h, w, h);
+  ctx.fillStyle = '#ffe9a8';
+  ctx.beginPath(); ctx.arc(x, y-h-34*scale, 40*scale, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#2b2b2b'; ctx.lineWidth=Math.max(1,10*scale);
+  ctx.beginPath(); ctx.arc(x, y-h-34*scale, 40*scale, 0, Math.PI*2); ctx.stroke();
+}
+
+function drawTree(x,y,scale){
+  ctx.fillStyle = '#5b3a22';
+  ctx.fillRect(x-20*scale, y-140*scale, 40*scale, 140*scale);
+  ctx.fillStyle = '#3f6b3f';
+  ctx.beginPath(); ctx.arc(x, y-250*scale, 140*scale, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#4d7d4d';
+  ctx.beginPath(); ctx.arc(x-55*scale, y-200*scale, 90*scale, 0, Math.PI*2); ctx.fill();
+}
+
+function drawCable(x,y,scale, topWorldY, seg){
+  var top = projectPoint(0, topWorldY, seg.p1.world.z, cam.x, cam.y, cam.z);
+  ctx.strokeStyle = COL.cable;
+  ctx.lineWidth = Math.max(1, 10*scale);
+  ctx.beginPath();
+  ctx.moveTo(top.screen.x, top.screen.y);
+  ctx.lineTo(x, y);
+  ctx.stroke();
+}
+
+function drawTower(x,y,scale, seg){
+  // main tower drawn as a large stone gothic double-arch structure spanning the deck
+  var baseW = 3400*scale, h = 5200*scale;
+  var topY = y - h;
+  ctx.fillStyle = COL.stone;
+  ctx.fillRect(x-baseW/2, topY, baseW, h);
+  ctx.fillStyle = COL.stoneShadow;
+  ctx.fillRect(x-baseW/2, topY, baseW*0.14, h);
+  ctx.fillRect(x+baseW/2-baseW*0.14, topY, baseW*0.14, h);
+
+  // crenellations
+  ctx.fillStyle = COL.stoneDark;
+  var crenN = 6;
+  for (var c=0;c<crenN;c++){
+    if (c%2===0) ctx.fillRect(x-baseW/2 + c*(baseW/crenN), topY-18*scale, baseW/crenN, 18*scale);
+  }
+
+  // two gothic arch openings
+  ctx.fillStyle = '#dfe8ef';
+  var archW = baseW*0.30, archH = h*0.55, archY = topY + h*0.30;
+  [ -baseW*0.22, baseW*0.22 ].forEach(function(dx){
+    var ax = x+dx;
+    ctx.beginPath();
+    ctx.moveTo(ax-archW/2, archY+archH);
+    ctx.lineTo(ax-archW/2, archY+archH*0.35);
+    ctx.quadraticCurveTo(ax, archY-archH*0.25, ax+archW/2, archY+archH*0.35);
+    ctx.lineTo(ax+archW/2, archY+archH);
+    ctx.closePath();
+    ctx.fill();
+  });
+}
+
+function drawCityHall(x,y,scale){
+  var w = 3600*scale, h=1400*scale;
+  ctx.fillStyle = '#e8e2d5';
+  ctx.fillRect(x-w/2, y-h, w, h);
+  ctx.fillStyle = '#cfc7b3';
+  for (var col=0; col<7; col++){
+    ctx.fillRect(x-w/2 + col*(w/7) + 6*scale, y-h+20*scale, (w/7)-12*scale, h-40*scale);
+  }
+  ctx.fillStyle = '#8f3b2b';
+  ctx.fillRect(x-w*0.08, y-h-40*scale, w*0.16, 40*scale);
+  // banner
+  ctx.fillStyle = '#c62828';
+  ctx.fillRect(x-160*scale, y-h-70*scale, 320*scale, 44*scale);
+  ctx.fillStyle = '#fff';
+  ctx.font = (26*scale)+'px Courier New';
+  ctx.textAlign='center';
+  ctx.fillText('CITY HALL', x, y-h-38*scale);
+}
+
+/* ---------------------------------------------------------------------
+   PLAYER SPRITE (fixed screen position, simple pixel courier)
+--------------------------------------------------------------------- */
+function drawPlayer(screenX, screenY, running, leaning){
+  ctx.save();
+  ctx.translate(screenX, screenY);
+  var lean = leaning*8;
+  ctx.translate(lean,0);
+  var legPhase = Math.sin(bobTimer*14) * (running?10:0);
+
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.3)';
+  ctx.beginPath(); ctx.ellipse(0, 6, 26, 8, 0,0,Math.PI*2); ctx.fill();
+
+  // legs
+  ctx.fillStyle = '#2b2f4a';
+  ctx.fillRect(-14, -18+legPhase*0.2, 10, 24-legPhase*0.2);
+  ctx.fillRect(4, -18-legPhase*0.2, 10, 24+legPhase*0.2);
+
+  // torso / jacket
+  ctx.fillStyle = '#d94b3a';
+  ctx.fillRect(-18, -58, 36, 44);
+  // bag strap
+  ctx.strokeStyle = '#5a3c22'; ctx.lineWidth=4;
+  ctx.beginPath(); ctx.moveTo(-16,-56); ctx.lineTo(14,-18); ctx.stroke();
+  ctx.fillStyle = '#5a3c22';
+  ctx.fillRect(6,-30,18,20);
+
+  // arms
+  ctx.fillStyle = '#d94b3a';
+  ctx.fillRect(-24, -50, 8, 26);
+  ctx.fillRect(16, -50, 8, 26);
+
+  // head
+  ctx.fillStyle = '#f0c9a0';
+  ctx.fillRect(-12,-84,24,26);
+  // cap
+  ctx.fillStyle = '#2b2f4a';
+  ctx.fillRect(-14,-90,28,10);
+  ctx.fillRect(-14,-84,10,6);
+
+  ctx.restore();
+}
+
+/* ---------------------------------------------------------------------
+   MAIN RENDER
+--------------------------------------------------------------------- */
+var cam = {x:0,y:0,z:0};
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+
+  var baseSegIdx = Math.floor(position/SEG_LEN) % segments.length;
+
+  cam.x = playerX * ROAD_WIDTH;
+  cam.y = CAMERA_HEIGHT;
+  cam.z = position;
+
+  drawBackground(cam.x);
+
+  var maxy = H;
+  var n, segIndexList = [];
+
+  // ---- pass 1: road ----
+  for (n=0; n<DRAW_DISTANCE; n++){
+    var idx = (baseSegIdx + n) % TOTAL_SEG;
+    var seg = segments[idx];
+    segIndexList.push(idx);
+
+    project(seg.p1, cam.x, cam.y, cam.z);
+    project(seg.p2, cam.x, cam.y, cam.z);
+
+    if (seg.p1.camera.z <= CAMERA_DEPTH) continue;
+    if (seg.p2.screen.y >= seg.p1.screen.y) continue;
+    if (seg.p2.screen.y >= maxy) continue;
+
+    renderRoadSegment(seg);
+    maxy = seg.p2.screen.y;
+  }
+
+  // ---- pass 2: sprites, far to near ----
+  for (n=DRAW_DISTANCE-1; n>=0; n--){
+    var idx2 = segIndexList[n];
+    var seg2 = segments[idx2];
+    if (seg2.p1.camera.z <= CAMERA_DEPTH) continue;
+    if (!seg2.sprites.length) continue;
+    var rawScale = seg2.p1.screen.scale;
+    var pxScale = rawScale * (W/2); // pixels-per-world-unit, matches p.screen.w convention
+    var sx = seg2.p1.screen.x, sy = seg2.p1.screen.y;
+
+    seg2.sprites.forEach(function(sp){
+      var offX = sx + rawScale * sp.offset * ROAD_WIDTH * (W/2);
+      if (sp.type==='lamp') drawLamp(offX, sy, pxScale);
+      else if (sp.type==='tree') drawTree(offX, sy, pxScale);
+      else if (sp.type==='tower') drawTower(sx, sy, pxScale, seg2);
+      else if (sp.type==='cityhall') drawCityHall(sx, sy, pxScale);
+      else if (sp.type==='cable'){
+        var h = cableHeight(seg2.p1.world.z);
+        drawCable(offX, sy, pxScale, h, seg2);
+      }
+    });
+  }
+
+  // ---- player ----
+  var pScreenX = W/2 + (playerX*0.5)*80;
+  drawPlayer(pScreenX, H*0.86, state==='playing', steer);
+
+  // vignette
+  var vg = ctx.createRadialGradient(W/2,H*0.6,H*0.25,W/2,H*0.6,H*0.85);
+  vg.addColorStop(0,'rgba(0,0,0,0)');
+  vg.addColorStop(1,'rgba(0,0,0,0.35)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0,0,W,H);
+}
+
+/* ---------------------------------------------------------------------
+   UPDATE / GAME LOOP
+--------------------------------------------------------------------- */
+function updateZoneLabel(){
+  var lbl = ZONES[0].label;
+  for (var i=0;i<ZONES.length;i++){
+    if (position >= ZONES[i].z) lbl = ZONES[i].label;
+  }
+  if (lbl !== currentZoneLabel){
+    currentZoneLabel = lbl;
+    document.getElementById('zoneLabel').textContent = lbl;
+    flashMessage(lbl);
+  }
+}
+
+var msgTimeout=null;
+function flashMessage(text){
+  var el = document.getElementById('msgBanner');
+  el.textContent = text;
+  el.style.opacity = 1;
+  clearTimeout(msgTimeout);
+  msgTimeout = setTimeout(function(){ el.style.opacity = 0; }, 1800);
+}
+
+function update(dt){
+  var s = touchSteer || readSteer();
+  steer += (s - steer) * Math.min(1, dt*8);
+
+  if (state==='playing'){
+    speed = Math.min(MAX_SPEED, speed + ACCEL*dt);
+    position += speed*dt;
+
+    playerX += steer * 1.6 * dt;
+    // keep on the deck (soft clamp with a little give at the rails)
+    var limit = 0.75;
+    if (playerX > limit) playerX = limit;
+    if (playerX < -limit) playerX = -limit;
+
+    updateZoneLabel();
+    document.getElementById('progressInner').style.width = Math.min(100, (position/TRACK_Z*100)) + '%';
+    document.getElementById('speedReadout').textContent = Math.round(speed/40);
+
+    if (position >= FINISH_IDX*SEG_LEN + 400){
+      speed = 0;
+      endGame();
+    }
+  }
+  bobTimer += dt;
+}
+
+function loop(ts){
+  if (lastTime===null) lastTime = ts;
+  var dt = Math.min(0.05, (ts-lastTime)/1000);
+  lastTime = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
